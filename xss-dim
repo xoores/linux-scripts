@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""
+Simple dimmer for xss-lock.
+
+It dim the screen using a provided delay and display a countdown. It
+will stop itself when the locker window is mapped.
+
+Needs:
+ - dev-python/python-xlib
+ 
+Shamelessly stolen from here:
+ - https://github.com/vincentbernat/i3wm-configuration/blob/master/bin/xss-dimmer
+
+The same author also wrote very nice blogpost about his i3 config and I
+can only recommend that as well:
+ - https://vincent.bernat.ch/en/blog/2021-i3-window-manager
+"""
+
+# It assumes we are using a compositor.
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk, GLib, GdkPixbuf
+import cairo
+import argparse
+import threading
+import time
+import math
+from Xlib import display, X
+from Xlib.error import BadWindow
+from Xlib.protocol.event import MapNotify
+
+
+def on_xevent(source, condition, xdisplay, locker):
+    while xdisplay.pending_events():
+        event = xdisplay.next_event()
+        if event.type != X.MapNotify:
+            continue
+        try:
+            wmclass = event.window.get_wm_class()
+        except BadWindow:
+            continue
+        if wmclass and wmclass[1] == locker:
+            Gtk.main_quit()
+            return False
+    return True
+
+
+def on_realize(widget):
+    window = widget.get_window()
+    window.set_override_redirect(True)
+
+
+def on_draw(widget, event, options, background, start):
+    x, y = widget.get_position()
+    wwidth, wheight = widget.get_size()
+    delta = options.end_opacity - options.start_opacity
+    elapsed = time.monotonic() - start
+    current = easing_functions[options.easing_function](elapsed / options.delay)
+    opacity = delta * current + options.start_opacity
+    cctx = event
+
+    # Background
+    scale = widget.get_scale_factor()
+    bg = None
+    if background:
+        bg = background.new_subpixbuf(x, y, wwidth * scale, wheight * scale)
+    cctx.set_operator(cairo.OPERATOR_SOURCE)
+    if not bg:
+        cctx.set_source_rgba(0, 0, 0, opacity)
+        cctx.paint()
+    else:
+        cctx.save()
+        cctx.scale(1 / scale, 1 / scale)
+        Gdk.cairo_set_source_pixbuf(cctx, bg, 0, 0)
+        cctx.paint_with_alpha(opacity)
+        cctx.restore()
+
+    # Remaining time
+    cctx.set_operator(cairo.OPERATOR_OVER)
+    remaining = str(round(options.delay - elapsed))
+    cctx.select_font_face(options.font, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cctx.set_font_size(wheight // 4)
+    _, _, twidth, theight, _, _ = cctx.text_extents("8" * len(remaining))
+    text_position = wwidth // 2 - twidth // 2, wheight // 2 + theight // 2
+    cctx.move_to(*text_position)
+    cctx.set_source_rgba(1, 1, 1, opacity)
+    cctx.show_text(remaining)
+    cctx.move_to(*text_position)
+    cctx.set_source_rgba(0, 0, 0, opacity * 2)
+    cctx.set_line_width(4)
+    cctx.text_path(remaining)
+    cctx.stroke()
+
+
+def on_refresh(window, options, start):
+    window.queue_draw()
+    elapsed = time.monotonic() - start
+    if elapsed < options.delay:
+        next_step = min(options.step, options.delay - elapsed)
+        GLib.timeout_add(options.step * 1000, on_refresh, window, options, start)
+
+
+# See: https://easings.net/
+easing_functions = {
+    "none": lambda x: x,
+    "out-circ": lambda x: math.sqrt(1 - pow(x - 1, 2)),
+    "out-sine": lambda x: math.sin(x * math.pi / 2),
+    "out-cubic": lambda x: 1 - pow(1 - x, 3),
+    "out-quint": lambda x: 1 - pow(1 - x, 5),
+    "out-expo": lambda x: 1 - pow(2, -10 * x),
+    "out-quad": lambda x: 1 - (1 - x) * (1 - x),
+    "out-bounce": (
+        lambda n1, d1: lambda x: n1 * x * x
+        if x < 1 / d1
+        else n1 * pow(x - 1.5 / d1, 2) + 0.75
+        if x < 2 / d1
+        else n1 * pow(x - 2.25 / d1, 2) + 0.9375
+        if (x < 2.5 / d1)
+        else n1 * pow(x - 2.625 / d1, 2) + 0.984375
+    )(7.5625, 2.75),
+    "out-elastic": (
+        lambda x: pow(2, -10 * x) * math.sin((x * 10 - 0.75) * (2 * math.pi) / 3) + 1
+    ),
+    "inout-quad": lambda x: 2 * x * x if x < 0.5 else 1 - pow(-2 * x + 2, 2) / 2,
+    "inout-quart": (
+        lambda x: 8 * x * x * x * x if x < 0.5 else 1 - pow(-2 * x + 2, 4) / 2
+    ),
+    "inout-expo": (
+        lambda x: pow(2, 20 * x - 10) / 2 if x < 0.5 else (2 - pow(2, -20 * x + 10)) / 2
+    ),
+    "inout-bounce": (
+        lambda x: (1 - easing_functions["out-bounce"](1 - 2 * x)) / 2
+        if x < 0.5
+        else (1 + easing_functions["out-bounce"](2 * x - 1)) / 2
+    ),
+}
+
+if __name__ == "__main__":
+    now = time.monotonic()
+    parser = argparse.ArgumentParser()
+    add = parser.add_argument
+    add("--start-opacity", type=float, default=0, help="initial opacity")
+    add("--end-opacity", type=float, default=1, help="final opacity")
+    add("--step", type=float, default=0.1, help="step for changing opacity")
+    add("--delay", type=float, default=10, help="delay from start to end")
+    add("--font", default="Iosevka Aile", help="font for countdown")
+    add("--locker", default="xsecurelock", help="quit if window class detected")
+    add("--background", help="use a background instead of black")
+    add(
+        "--easing-function",
+        default="none",
+        choices=easing_functions.keys(),
+        help="easing function for opacity",
+    )
+    options = parser.parse_args()
+
+    background = None
+    if options.background:
+        try:
+            background = GdkPixbuf.Pixbuf.new_from_file(options.background)
+        except Exception:
+            pass
+
+    # Setup dimmer windows on each monitor
+    gdisplay = Gdk.Display.get_default()
+    for i in range(gdisplay.get_n_monitors()):
+        geom = gdisplay.get_monitor(i).get_geometry()
+
+        window = Gtk.Window()
+        window.set_app_paintable(True)
+        window.set_type_hint(Gdk.WindowTypeHint.SPLASHSCREEN)
+        window.set_visual(window.get_screen().get_rgba_visual())
+
+        window.set_default_size(geom.width, geom.height)
+        window.move(geom.x, geom.y)
+
+        window.connect("draw", on_draw, options, background, now)
+        window.connect("delete-event", Gtk.main_quit)
+        window.connect("realize", on_realize)
+
+        window.show_all()
+
+        # Schedule refresh with window.queue_draw()
+        on_refresh(window, options, now)
+
+    # Watch for locker window
+    xdisplay = display.Display()
+    root = xdisplay.screen().root
+    root.change_attributes(event_mask=X.SubstructureNotifyMask)
+    channel = GLib.IOChannel.unix_new(xdisplay.fileno())
+    channel.set_encoding(None)
+    channel.set_buffered(False)
+    GLib.io_add_watch(
+        channel,
+        GLib.PRIORITY_DEFAULT,
+        GLib.IOCondition.IN,
+        on_xevent,
+        xdisplay,
+        options.locker,
+    )
+    xdisplay.pending_events()  # otherwise, socket is inactive
+
+    # Main loop
+    Gtk.main()

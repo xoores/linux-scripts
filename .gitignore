@@ -1,0 +1,20 @@
+# We want to manually specify each and every file that is to be included in our
+# git repository as some of my scripts may still contain private data and I need
+# to clean them up first...
+
+**
+!/*.md
+!/.gitignore
+!/_common.sh
+!/brightness.sh
+!/i3launcher.sh
+!/get-edid.py
+!/pingnet.sh
+!/reload_yubi.sh
+!/rofi_wifi.sh
+!/screenlock.sh
+!/xss-dim
+!/screenshot.sh
+!/sleep.sh
+!/sys.sh
+!/rofi_emoji.sh
