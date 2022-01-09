@@ -1,0 +1,1636 @@
+#!/usr/bin/python3
+
+"""
+Puppeteer for i3
+
+Shamelessly stolen from [1]. Author of the original script also wrote very nice
+blogpost [2] that is very much worth reading as well.
+
+I ended up converting some of my bash magic scripts and moved them here.
+
+Needs (Gentoo):
+ - dev-python/i3ipc
+ - dev-python/xcffib
+ - dev-python/python-evdev
+ - dev-python/dbussy::zyrenth
+   > eselect repository enable zyrenth
+
+Configuration is loaded from config file ~/.config/i3master.conf with
+syntax from Pythons ConfigParser.
+
+Sample config
+---------------------------
+[global]
+network_helperscript = /scripts/net.sh
+backlight_file = /sys/class/backlight/*/actual_brightness
+xkb_input_monitor = /dev/input/event*
+
+[workspace-icons]
+ignored-workspaces =
+	0,  # Browser
+	3   # Mail
+
+[ap-aliases]
+# Home
+11:22:33:44:55:66 = MyAP-1
+---------------------------
+
+Links:
+ 1: https://github.com/vincentbernat/i3wm-configuration/blob/master/bin/i3-companion
+ 2: https://vincent.bernat.ch/en/blog/2021-i3-window-manager
+"""
+
+import argparse
+import asyncio
+import collections
+import contextlib
+import configparser
+import errno
+import functools
+import glob
+import html
+import logging
+import logging.handlers
+import os
+import re
+import shlex
+import subprocess
+import sys
+import types
+import traceback
+import evdev
+from evdev import InputDevice, ecodes
+from enum import Enum
+from math import gcd
+from Xlib.ext.randr import *
+from Xlib import X, Xutil, display, protocol
+from collections import defaultdict
+
+import i3ipc
+from i3ipc.aio import Connection
+import ravel
+import dbussy
+import xcffib
+import xcffib.xproto
+import xcffib.randr
+
+
+try:
+	from systemd import journal, daemon
+	USE_SYSTEMD=True
+except:
+	USE_SYSTEMD=False
+
+
+
+
+
+########################################################################
+# C O N F I G U R A T I O N
+#
+# Section to be changed to reflect users desires
+
+
+def icon(font_number, char):
+    """Turn an icon into a string for Polybar."""
+    if font_number == 0: return char
+    return "%%{T%d}%s%%{T-}" % (font_number, char)
+
+# Font number is from Polybar configuration and it is 1-based!!! We can
+# define the same font but with different properties (size, style...) so
+# we can alter icons as necessary
+#
+# 0 = don't decorate icons - used for i3 namespaces renaming
+#
+# Polybar config:
+# ~ font-0 = monospace:style=Regular:size=9;4
+# ~ font-1 = BitstreamVeraSansMono Nerd Font Mono:style=Bold:size=14;4
+# ~ font-2 = DejaVu Sans M0no:style=Book:size=13;4
+# ~ font-3 = BitstreamVeraSansMono Nerd Font Mono:size=8;4
+# ~ font-4 = BitstreamVeraSansMono Nerd Font Mono:size=20;6
+application_icons = {
+    "chromium": 				icon(5, ""),
+    "pavucontrol": 				icon(5, ""),
+    "kitty": 					icon(5, ""),
+    "qalculate": 				icon(5, ""),
+    "qemu": 					icon(5, ""),
+    "sublime_text": 			icon(5, ""),
+    "wireshark": 				icon(5, "ﯳ"),
+    "thunderbird": 				icon(5, ""),
+    "libreoffice-calc": 		icon(5, ""),
+    #"libreoffice-calc": 		icon(5, ""),
+    "libreoffice-writer": 		icon(5, ""),
+    #"libreoffice-writer": 		icon(5, ""),
+    "libreoffice-impress": 		icon(5, ""),
+    "xfreerdp": 				icon(5, ""),
+    "pcmanfm-qt": 				icon(5, ""),
+    "spacefm": 					icon(5, ""),
+    "firefox": 					icon(5, ""),
+    #"firefox": 				icon(5, ""),
+    "geany": 					icon(5, ""),
+    #"geany": 					icon(5, ""),
+    "keepassxc": 				icon(5, ""),
+    #"pdf": 					icon(5, ""),
+    "master pdf editor 5": 		icon(5, ""),
+    #"image": 					icon(5, ""),
+    #"image": 					icon(5, ""),
+    #"image": 					icon(5, ""),
+    #"image": 					icon(5, ""),
+    "vlc": 						icon(5, "嗢"),
+    "gqrx": 					icon(5, ""),
+    "vivaldi-stable": 			icon(5, ""),
+    "gnuradio-companion": 		icon(5, "露"),
+}
+
+application_icons_unknown = 	icon(1, "ﬓ")
+
+icons = {
+	"access-point": 			icon(2, ""),
+	"bluetooth": 				icon(2, ""),
+	"bluetooth-off": 			icon(2, ""),
+	"camera": 					icon(2, ""),
+	"car": 						icon(2, ""),
+	"gamepad": 					icon(2, ""),
+	"headphones": 				icon(2, ""),
+	"audio-headset": 			icon(2, ""),
+	"input-keyboard": 			icon(5, ""),
+	"laptop": 					icon(2, ""),
+	"loudspeaker": 				icon(2, "蓼"),
+	"microphone": 				icon(2, ""),
+	"input-mouse": 				icon(2, ""),
+	"notifications-disabled": 	icon(2, ""),
+	"notifications-enabled": 	icon(2, ""),
+	"nowifi": 					icon(2, "睊"),
+	"phone": 					icon(2, ""),
+	"printer": 					icon(2, ""),
+	"scanner": 					icon(2, "ﮩ"),
+	"unknown": 					icon(2, ""),
+	"vpn": 						icon(2, ""),
+	"webcam": 					icon(2, ""),
+	"wifi-100": 				icon(3, ""),
+	"wifi-80": 					icon(3, ""),
+	"wifi-60": 					icon(3, ""),
+	"wifi-40": 					icon(3, ""),
+	"wifi-20": 					icon(3, ""),
+	"wifi-0": 					icon(3, ""),
+	"wired": 					icon(2, ""),
+	"modem": 					icon(2, ""),
+	"temp_c": 					icon(2, "糖"),
+	"batt-100": 				icon(4, ""),
+	"batt-90": 					icon(4, ""),
+	"batt-80": 					icon(4, ""),
+	"batt-70": 					icon(4, ""),
+	"batt-60": 					icon(4, ""),
+	"batt-50": 					icon(4, ""),
+	"batt-40": 					icon(4, ""),
+	"batt-30": 					icon(4, ""),
+	"batt-20": 					icon(4, ""),
+	"batt-10": 					icon(4, ""),
+	"batt-0": 					icon(2, ""),
+}
+
+
+
+
+########################################################################
+# S T A T I C   D E F I N E S
+#
+# Icons, some NM constants and stuff like that
+
+def create_dict_from_var( prefix ):
+	""" Used for transforming static variables into enums """
+
+	return dict(
+				(eval(v), v.replace(prefix, ""))
+				for v in
+				[i for i in globals() if i.startswith(prefix)]
+			)
+
+# Events for @on decorator
+DBusSignal = collections.namedtuple(
+    "DBusSignal",
+    ["interface", "member", "signature", "system", "path", "onlyif"],
+    defaults=(True, "/", None),
+)
+
+FileWatcher = collections.namedtuple(
+    "File",
+    ["path", "binary", "poll", "monitor"],
+    defaults=(True, 0, False),
+)
+
+StartEvent = object()
+I3Event = i3ipc.Event
+i3CommandEvent = collections.namedtuple("CommandEvent", ["name"])
+logger = logging.getLogger("i3master")
+config = configparser.RawConfigParser(
+								delimiters="=",
+								inline_comment_prefixes=('#', ';'),
+								default_section="global",
+		)
+
+EVENT_MASK_XORG = 0
+EVENT_MASK_RANDR = 1
+
+def xorg_event(type, filter):
+	""" Convert Xorg event to a tuple """
+	return type, filter
+
+# Since X events are basically just integers, current implementation
+# will silently ignore them - beware!
+# TODO: Fix impl (eventually) as this is shit
+xorg_event_masks = {
+	"OutputPropertyNotify": xorg_event(EVENT_MASK_RANDR, RROutputPropertyNotifyMask),
+	"MotionNotify": xorg_event(EVENT_MASK_XORG, X.ButtonMotionMask |
+												X.Button1MotionMask |	
+												X.Button2MotionMask |	
+												X.Button3MotionMask |
+												X.Button4MotionMask |	
+												X.Button5MotionMask ),
+}
+
+
+# Sauce: https://networkmanager.dev/docs/api/1.32.8/nm-dbus-types.html
+NM_ACTIVE_CONNECTION_STATE_ACTIVATED = 2
+
+NM_DEVICE_TYPE_ETHERNET 	= 1
+NM_DEVICE_TYPE_WIFI 		= 2
+NM_DEVICE_TYPE_BT 			= 5
+NM_DEVICE_TYPE_MODEM 		= 8
+NM_DEVICE_TYPE_BOND 		= 10
+NM_DEVICE_TYPE_VLAN 		= 11
+NM_DEVICE_TYPE_BRIDGE 		= 13
+NM_DEVICE_TYPE_TEAM 		= 15
+NM_DEVICE_TYPE_TUN 			= 16
+NM_DEVICE_TYPE_IP_TUNNEL 	= 17
+NM_DEVICE_TYPE_PPP 			= 23
+
+NM_DEVICE_STATE_UNMANAGED 		= 10
+NM_DEVICE_STATE_UNAVAILABLE 	= 20
+NM_DEVICE_STATE_DISCONNECTED 	= 30
+NM_DEVICE_STATE_PREPARE 		= 40
+NM_DEVICE_STATE_CONFIG 			= 50
+NM_DEVICE_STATE_ACTIVATED 		= 100
+NM_DEVICE_STATE_DEACTIVATING 	= 110
+NM_DEVICE_STATE_FAILED 			= 120
+
+nm_device_type = create_dict_from_var("NM_DEVICE_TYPE_")
+nm_device_state = create_dict_from_var("NM_DEVICE_STATE_")
+
+
+
+# DBUS constants
+DBUS__BLUEZ = "org.bluez"
+DBUS__BLUEZ_PATH =  "/" + DBUS__BLUEZ.replace(".", "/")
+
+DBUS__NM = "org.freedesktop.NetworkManager"
+DBUS__NM_PATH =  "/" + DBUS__NM.replace(".", "/")
+
+DBUS__NOTIFICATIONS = "org.freedesktop.Notifications"
+DBUS__NOTIFICATIONS_PATH =  "/" + DBUS__NOTIFICATIONS.replace(".", "/")
+
+DBUS__UPOWER = "org.freedesktop.UPower"
+DBUS__UPOWER_PATH =  "/" + DBUS__UPOWER.replace(".", "/")
+
+DBUS__OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
+DBUS__PROPERTIES = "org.freedesktop.DBus.Properties"
+
+
+
+
+########################################################################
+# F U N C T I O N   D E C O R A T O R S
+#
+# Decorators used for events etc...
+
+def static(**kwargs):
+    """Define static variables for the event handler."""
+
+    def decorator(fn):
+        fn.__dict__.update(kwargs)
+        return fn
+
+    return decorator
+
+
+@static(functions={})
+def on(*events):
+    """Tag events that should be provided to the function."""
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        on.functions[fn] = events
+        return wrapper
+
+    return decorator
+
+
+def retry(max_retries):
+    """Retry an async function."""
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            retries = max_retries
+            while True:
+                try:
+                    #logger.debug("execute %s (remaining tries: %s)", fn, retries)
+                    return await fn(*args, **kwargs)
+                except Exception as e:
+                    if retries > 0:
+                        retries -= 1
+                        logger.warning(
+                            f"while executing {fn} (remaining tries: %d): %s",
+                            retries,
+                            e,
+                        )
+                    else:
+                        logger.exception(f"while executing {fn}: %s", e)
+                        return
+
+        return wrapper
+
+    return decorator
+
+
+def debounce(sleep, *, unless=None):
+    """Debounce a function call (batch successive calls into only one).
+    Optional immediate execution. Ensure only one instance is
+    executed. It is assumed the arguments provided to the debounced
+    function have no effect on its execution."""
+
+    def decorator(fn):
+        async def worker():
+            while True:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    # Wait for an urgent work or until sleep is elapsed
+                    await asyncio.wait_for(workers[fn].urgent.wait(), timeout=sleep)
+                    logger.debug("urgent work received for %s", fn)
+                args, kwargs = workers[fn].queue
+                workers[fn].queue = None
+                workers[fn].urgent.clear()
+
+                # Execute the work
+                #logger.debug("execute work for %s", fn)
+                try:
+                    await fn(*args, **kwargs)
+                except Exception as e:
+                    logger.debug("while running %s, worker got %s", fn, e)
+                    workers[fn] = None
+                    raise
+
+                # Do we still have something to do?
+                if workers[fn].queue is None:
+                    break
+
+            # No more work
+            #logger.debug("no more work for %s", fn)
+            workers[fn] = None
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            if workers[fn] is None:
+                #logger.debug("create new worker for %s", fn)
+                workers[fn] = types.SimpleNamespace()
+                workers[fn].task = asyncio.create_task(worker())
+                workers[fn].urgent = asyncio.Event()
+                workers[fn].queue = (args, kwargs)
+            else:
+                #logger.debug("enqueue new work for %s", fn)
+                True
+            if unless is not None and unless(*args, **kwargs):
+                #logger.debug("wake up now for %s", fn)
+                workers[fn].urgent.set()
+            return await workers[fn].task
+
+        workers[fn] = None
+        return wrapper
+
+    workers = {}
+    return decorator
+
+
+
+def polybar(module):
+	"""
+	Use returned string to update polybar module
+	
+	Function can either return string or Tuple (str, str). First tuple
+	element is then treated as "extension" name, the second as content.
+	"""
+
+	def decorator(fn):
+		@functools.wraps(fn)
+		async def wrapper(*args, **kwargs):
+			r = await fn(*args, **kwargs)
+			
+			if type(r) is tuple:
+				iface = r[0]
+				content = r[1]
+				modulename = f"{module}_{iface}"
+			else:
+				content = r
+				modulename = f"{module}"
+			
+				
+			if type(content) is not str or cache.get(modulename) == content:
+				return content
+
+			content = " %s " % content
+			# Update cache file (for when polybar restarts)
+			with open(f"{os.getenv('XDG_RUNTIME_DIR')}/i3/{modulename}", "w") as out:
+				out.write(content)
+
+			# Send it to polybar
+			for name in glob.glob("/tmp/polybar_mqueue.*"):
+				try:
+					#logger.debug(f"Trying to write to {name}: action:#{modulename}.send.{content}")
+					with open(os.open(name, os.O_WRONLY | os.O_NONBLOCK), "w") as out:
+						cmd = f"action:#{modulename}.send.{content}"
+						out.write(cmd)
+				except OSError as e:
+					if e.errno != errno.ENXIO:
+						raise
+
+			if modulename not in cache:
+				logger.info(f"polybar/{modulename}: content initialized")
+			else:
+				logger.debug(f"polybar/{modulename}: content updated")
+				
+			cache[modulename] = content
+			return content
+
+		return wrapper
+
+	cache = {}
+	return decorator
+
+
+
+########################################################################
+# H E L P E R S
+#
+# Random/miscellaious helper functions
+
+
+def colorize(s, color):
+	return "%%{F%s}%s%%{F-}" % (color, s)
+
+
+def file_read(path):
+	lines = ""
+	
+	try:
+		pg = glob.glob(path)
+		
+		if len(pg) == 0:
+			raise Exception("File not found")
+		
+		p = os.path.expanduser(pg[0])
+		f = open(p,"r")
+		lines = f.readlines()
+		f.close()
+	except Exception as e:
+		logger.error(f"Failed to read file '{path}': {e}")
+		
+	return "".join(lines)
+
+# DBUS sends data as a "tuple of tuples" where the inner tuples are used
+# as {DBUS.Signature, value}. What a PITA and I could not get any "Clean"
+# way to deal with this shit other that this. 
+def dbus_unwrap(val):
+	if isinstance(val, tuple) and isinstance(val[0], dbussy.DBUS.Signature):
+		#print("---Unwrapping DBUStuple %s - val is type %s" % (val[0], type(val[1])))
+		return dbus_unwrap(val[1])
+	else:
+		return val
+
+# Similar to dbus_unwrap, this thing adds DBUS tuple into dictionary
+def dbus_dictionary_add(dictionary, key, value):
+	if type(value) is int:
+		t = "i"
+	else:
+		log.error(f"Cannot add to DBUS dict, ukhandled type '{type(value)}'")
+	dictionary[key] = (t, value)
+
+
+
+async def notify(i3, **kwargs):
+    """Send a notification with notify-send."""
+    conn = i3.session_bus[DBUS__NOTIFICATIONS]
+    obj = conn[DBUS__NOTIFICATIONS_PATH]
+    notifications = await obj.get_async_interface(DBUS__NOTIFICATIONS)
+    parameters = dict(
+        app_name=logger.name,
+        replaces_id=0,
+        app_icon="dialog-information",
+        summary="",
+        actions=[],
+        hints={},
+        expire_timeout=5000,
+    )
+    parameters.update(kwargs)
+    return await notifications.Notify(**parameters)
+
+
+async def create_new_workspace(i3):
+    """Create a new workspace and returns its number."""
+    workspaces = await i3.get_workspaces()
+    workspace_nums = {w.num for w in workspaces}
+    max_num = max(workspace_nums)
+    available = (set(range(1, max_num + 2)) - workspace_nums).pop()
+    logger.info(f"create new workspace number {available}")
+    await i3.command(f'workspace number "{available}"')
+    return available
+
+
+
+@polybar("network")
+async def handle_network(conn, nm, device):
+	status = []
+	modulecolor=""
+	finalstate=""
+    
+	nmd = await conn[device].get_async_interface(f"{DBUS__NM}.Device")
+	kind = await nmd.DeviceType
+	kind_str = nm_device_type.get(kind, f"UNKNOWN_{kind}")
+	state = await nmd.State
+	state_str = nm_device_state.get(state, f"UNKNOWN_{state}")
+	iface = await nmd.Interface
+	
+	if kind == NM_DEVICE_TYPE_WIFI:
+		if state != NM_DEVICE_STATE_ACTIVATED:
+			status.append( icons["nowifi"] )
+		else:
+			nmw = await conn[device].get_async_interface(f"{DBUS__NM}.Device.Wireless")
+			ap = await nmw.ActiveAccessPoint
+			ip4cfg = await nmd.Ip4Config
+			if not ap:
+				status.append(icons["nowifi"])
+			else:
+				network_manager_status.active_ap = ap
+				nmap = await conn[ap].get_async_interface(f"{DBUS__NM}.AccessPoint")
+				name = await nmap.Ssid
+				bssid = str(await nmap.HwAddress)
+				strength = int(await nmap.Strength)
+				ap_name = ap_alias.get(bssid.lower(), bssid.lower())
+
+				status.append(
+					"" + [
+						icons["wifi-0"],
+						icons["wifi-20"],
+						icons["wifi-40"],
+						icons["wifi-60"],
+						icons["wifi-80"],
+						icons["wifi-100"],
+					][strength // 17]
+					+ " "
+					+ bytes(name).decode("utf-8", errors="replace").replace("%", "%%")
+					+ " <" + ap_name + ">"
+				)
+	elif kind == NM_DEVICE_TYPE_ETHERNET:
+		status.append(icons["wired"])
+		
+	elif kind == NM_DEVICE_TYPE_MODEM:
+		status.append(icons["modem"])
+
+	elif kind == NM_DEVICE_TYPE_BT or kind == NM_DEVICE_TYPE_BRIDGE:
+		return (iface, None)
+	else:
+		status.append( "unknown-kind=" + str(kind) )
+	
+	
+	if state == NM_DEVICE_STATE_ACTIVATED:
+		try:
+			ip4cfg = await nmd.Ip4Config
+			nip4 = await conn[ip4cfg].get_async_interface(f"{DBUS__NM}.IP4Config")
+			addrdata = await nip4.AddressData
+			
+			fip = dbus_unwrap(addrdata[0]['address']) + "/" + str(dbus_unwrap(addrdata[0]['prefix']))
+			status.append(f"[{fip}]")
+		except:
+				logger.info(f"Device {iface} ({kind_str}) does not have IPv4 configuration...")
+			
+		modulecolor="#0f0"
+	elif state >= NM_DEVICE_STATE_DISCONNECTED and state < NM_DEVICE_STATE_ACTIVATED:
+		modulecolor="#ff0"
+	else:
+		modulecolor="#aaa"
+	
+	
+	# Let's construct final string for Polybar
+	finalstate =  " ".join(status)
+	
+	if len(modulecolor):
+		finalstate = "%%{F%s}%s%%{F-}" % (modulecolor, finalstate)
+	
+	hs = os.path.expanduser(network_helperscript)
+	if len(hs):
+		finalstate = "%%{A2:%s %s toggle:}%s%%{A}" % (hs, iface, finalstate)
+		finalstate = "%%{A3:%s %s menu:}%s%%{A}" % (hs, iface, finalstate)
+	
+	
+	return (iface, finalstate)
+
+
+
+
+########################################################################
+# E V E N T   H A N D L E R S
+#
+# Definition of our event handlers
+
+@on(i3CommandEvent("i3master-quit"))
+async def tickupdate(i3, event):
+	logger.warning("i3ipc requested exit")
+	i3.main_quit()
+	
+	
+	
+@on(StartEvent, i3CommandEvent("xkbled-update"))
+@polybar("xkb_leds")
+async def keyboard_leds_update(i3, event):
+	status = []
+
+	for edin in glob.glob(xkb_input_monitor):
+		try:
+			dev = InputDevice(edin)
+			capabs = dev.capabilities()
+			leds = dev.leds()
+			
+			# No CAPSLOCK or NUMLOCK == not interested. Also when the device
+			# will not have EV_KEYS this will throw a KeyError which we
+			# can silently ignore :-)
+			if 58 not in capabs[1] or 69 not in capabs[1]: continue
+			
+			logger.debug(f"Using {edin} as CAPSL/NUML status source...")
+			
+			if 0 not in leds: status.append("NUM OFF")
+			if 1 in leds: status.append("CAPS ON")
+				
+			dev.close()
+			break
+		except KeyError as e:
+			logger.debug(f"EVDEV input {edin} is not a valid candidate")
+		except Exception as e:
+			logger.exception("Exception during EVDEV state enum: %s", e)
+
+	return "%%{F%s}%s%%{F-}" % ("#ff0", " ".join(status))
+	
+
+
+workspace_cache = dict()
+@on(StartEvent, I3Event.WINDOW_MOVE, I3Event.WINDOW_NEW, I3Event.WINDOW_CLOSE)
+@debounce(0.2)
+async def workspace_rename(i3, event):
+	"""Rename workspaces using icons to match what's inside it."""
+	tree = await i3.get_tree()
+	workspaces = tree.workspaces()
+	commands = []
+	
+
+	for workspace in workspaces:
+		# Skip workspaces that we want to ignore
+		if workspace.num in application_icons_ws_ignore:
+				continue
+
+		dump_workspace = False if workspace.num in workspace_cache else True
+		
+		
+		windows = list()
+		icons = set()
+		for window in workspace.leaves():
+			if window.sticky:
+				continue
+			cls = (window.window_class or "").lower()
+			#if cls in application_icons_ignore:
+			#    continue
+			icon = application_icons.get(cls, application_icons.get(cls.split("-")[0]))
+			icons.add(icon or application_icons_unknown)
+			windows.append({
+							"t": cls,
+							"i": (icon or application_icons_unknown)
+			})
+		
+		#if any([i not in application_icons_alone for i in icons]):
+		#    icons -= application_icons_alone
+		workspace_cache[workspace.num] = windows
+		
+		# This basically is so I can have custom numbers
+		new_num = workspace.num
+		if new_num >= 30: new_num -= 30
+		
+		new_name = f"{workspace.num}:" + "%{T6}" + f"{new_num}" + " %{T-}" + "|".join(sorted(list(icons))).rstrip(":")
+		
+			
+		# Log if changed...
+		if dump_workspace or workspace.name != new_name:
+			logger.debug("Workspace[%d] changed: %s", workspace.num, workspace.name)
+			for w in workspace_cache[workspace.num]:
+				logger.debug(" |- [%s] %s", w['i'], w['t'])
+			
+		# Proceed with renaming if necessary
+		if workspace.name != new_name:
+			logger.info("Will rename workspace %d: '%s' => '%s'", 
+				workspace.num, workspace.name, new_name)
+			command = f'rename workspace "{workspace.name}" to "{new_name}"'
+			commands.append(command)
+		
+			
+	await i3.command(";".join(commands))
+
+
+
+
+@on(I3Event.OUTPUT, StartEvent)
+@static(last_setup=None)
+@debounce(1)
+async def output_update(i3, event):
+	"""React to a XRandR change."""
+
+	# Grab current setup. Synchronous, but it's short enough
+	randr = i3.x11(xcffib.randr.key)
+	screen = i3.x11.get_setup().roots[0]
+	monitors = randr.GetMonitors(screen.root, 1).reply().monitors
+	current_setup = {
+		(
+			i3.x11.core.GetAtomName(m.name).reply().name.to_string(),
+			m.width,
+			m.height,
+			m.x,
+			m.y,
+		)
+		for m in monitors
+	}
+	
+
+	# Compare to current setup
+	if current_setup == output_update.last_setup:
+		logger.info("current xrandr setup unchanged")
+		return
+	output_update.last_setup = current_setup
+	logger.info("xrandr setup: %s", current_setup)
+	if event is StartEvent:
+		return
+
+	# Trigger changes
+	logger.info("xrandr change detected")
+	cmds = (
+		#"systemctl --user reload --no-block xsettingsd.service",
+		#"systemctl --user start --no-block wallpaper.service",
+	)
+	for cmd in cmds:
+		proc = subprocess.run(shlex.split(cmd))
+		if proc.returncode != 0:
+			logger.warning(f"{cmd} exited with {proc.returncode}")
+
+
+
+
+
+@on(
+    DBusSignal(
+        path=DBUS__BLUEZ_PATH,
+        interface=DBUS__PROPERTIES,
+        member="PropertiesChanged",
+        signature="sa{sv}as",
+        onlyif=lambda args: args[0] == "org.bluez.Device1" and "Connected" in args[1],
+    )
+)
+async def bluetooth_notifications(i3, event, path, interface, changed, invalid):
+    """Display notifications related to Bluetooth state."""
+    obj = i3.system_bus[DBUS__BLUEZ][path]
+    obd = await obj.get_async_interface(interface)
+    name = await obd.Name
+    icon = await obd.Icon
+    state = await obd.Connected
+    state = "connected" if state else "disconnected"
+    await notify(
+        i3,
+        app_icon=icon,
+        summary=name,
+        body=f"Bluetooth device {state}",
+    )
+
+
+
+
+# Choose appropriate icons for output
+# See: https://btprodspecificationrefs.blob.core.windows.net/assigned-numbers
+#      /Assigned%20Number%20Types/Baseband.pdf
+bluetooth_classes = {
+	1: "laptop",
+	2: "phone",
+	3: "access-point",
+	(4, 1): "audio-headset",
+	(4, 2): "audio-headset",
+	(4, 4): "microphone",
+	(4, 5): "loudspeaker",
+	(4, 7): "loudspeaker",
+	(4, 10): "loudspeaker",
+	(4, 6): "headphones",
+	(4, 8): "car",
+	(4, 12): "webcam",
+	(5, 1): "gamepad",
+	(5, 2): "gamepad",
+	5: [
+		(lambda x: x & 0x10, "input-keyboard"),
+		(lambda x: x & 0x20, "input-mouse"),
+	],
+	6: [
+		(lambda x: x & 0x8, "camera"),
+		(lambda x: x & 0x10, "scanner"),
+		(lambda x: x & 0x20, "printer"),
+	],
+}
+
+
+@on(
+    StartEvent,
+    DBusSignal(
+        path=DBUS__BLUEZ_PATH,
+        interface=DBUS__PROPERTIES,
+        member="PropertiesChanged",
+        signature="sa{sv}as",
+        onlyif=lambda args: (
+            args[0] == "org.bluez.Device1"
+            and "Connected" in args[1]
+            or args[0] == "org.bluez.Adapter1"
+            and "Powered" in args[1]
+        ),
+    ),
+)
+@retry(2)
+@debounce(0.2)
+@polybar("bluetooth")
+async def bluetooth_status(i3, event, *args):
+	def wrap(s):
+		s = "%%{A3:%s:}%s%%{A}" % ("blueman-manager", s)
+		s = "%%{A2:%s:}%s%%{A}" % ("sudo rfkill toggle bluetooth", s)
+		return s
+		
+	
+	"""Update bluetooth status for Polybar."""
+	if event is StartEvent:
+		# Do we have a bluetooth device?
+		if not os.path.exists("/sys/class/bluetooth"):
+			logger.info("no bluetooth detected")
+			return ""
+
+	conn = i3.system_bus["org.bluez"]
+	om = await conn["/"].get_async_interface(DBUS__OBJECT_MANAGER)
+	objects = (await om.GetManagedObjects())[0]
+	powered = False
+	connected = 0
+	output = [ colorize(icons["bluetooth"], "#0f0") ]
+
+
+				
+	# List of available upower devices
+	upower_devices = []
+	try:
+		conn_upower = i3.system_bus[DBUS__UPOWER]
+		upower = await conn_upower[DBUS__UPOWER_PATH].get_async_interface(DBUS__UPOWER)
+		
+		for updevice in (await upower.EnumerateDevices())[0]:
+			try:
+				d = await conn_upower[updevice].get_async_interface(DBUS__PROPERTIES)
+				p = await d.GetAll(f"{DBUS__UPOWER}.Device")
+				upower_devices.append( (updevice, p[0]) )
+			except Exception as e:
+				logger.error(f"Failed to enumerate UPower device {updevice}: %s", e)
+	except Exception as e:
+		logger.error(f"Failed to get UPower devices: %s", e)
+			
+	
+	
+	# OK, get the info
+	devices = []
+	for path, interfaces in objects.items():
+		if "org.bluez.Adapter1" in interfaces:
+			# We get an adapter!
+			adapter = interfaces["org.bluez.Adapter1"]
+			if adapter["Powered"][1]:
+				powered = True
+		elif "org.bluez.Device1" in interfaces:
+			# We have a device!
+			device = interfaces["org.bluez.Device1"]
+			if not device["Connected"][1]:
+				continue
+				
+			connected += 1
+			
+			#logger.debug(f"BT device: {device}")
+			
+			battery = -1
+			addr = dbus_unwrap(device["Address"])
+			name = addr
+			if "Alias" in device: name = dbus_unwrap(device["Name"])
+			elif "Name" in device: name = dbus_unwrap(device["Alias"])
+					
+
+			for up_path, up_info in upower_devices:
+				serial = dbus_unwrap(up_info['Serial'])
+				if serial != addr:
+					continue
+
+				battery = int(dbus_unwrap(up_info['Percentage']))
+				battery_level = int(battery/10)*10
+				logger.debug(f"Device {name} is {up_path}!")
+				
+			
+			dev_icon = ""
+			
+			if "Icon" in device:
+				i = dbus_unwrap(device["Icon"])
+				if i in icons:
+					dev_icon = icons[i]
+				else:
+					logger.warning(f"BT_DEVICE[{name}]: Suggested icon '{i}' is not in our iconset, will try to parse device class")
+			
+			
+			if dev_icon == "":
+				icon = "unknown"
+				if "Class" in device:
+					#device_class = device["Class"][1]
+					device_class = dbus_unwrap(device["Class"])
+					major = (device_class & 0x1F00) >> 8
+					minor = (device_class & 0xFC) >> 2	
+					
+					icon = bluetooth_classes.get((major, minor)) or bluetooth_classes.get(major, "unknown")
+					if type(icon) is list:
+						for matcher, name in icon:
+							if matcher(minor):
+								icon = name
+								break					
+				else:
+					logger.warning(f"BT_DEVICE[{name}]: Device has no Class!")
+				
+				dev_icon = icons[icon]
+			
+			
+			
+			if battery >= 0:
+				dev_icon += f" {icons['batt-' + str(battery_level)]}"
+				if battery_level <= 10:
+					dev_icon = colorize(dev_icon, "#f00")
+				elif battery_level <= 40:
+					dev_icon = colorize(dev_icon, "#ff0")
+					
+			output.append(dev_icon)
+			
+			
+	
+	if not powered:
+		return wrap( colorize(icons["bluetooth-off"], "#aaa" ) )
+	
+	if connected == 0:
+		return wrap( colorize(icons["bluetooth"], "#ff0" ) )
+
+		
+	return wrap(
+				"|".join(output)
+			)
+
+
+
+@on(
+    StartEvent,
+    DBusSignal(
+        interface=f"{DBUS__NM}.Connection.Active",
+        member="StateChanged",
+        signature="uu",
+    ),
+    DBusSignal(
+        path=f"{DBUS__NM_PATH}/AccessPoint",
+        interface=DBUS__PROPERTIES,
+        member="PropertiesChanged",
+        signature="sa{sv}as",
+        onlyif=lambda args: (args[0] == f"{DBUS__NM}.AccessPoint"),
+    ),
+)
+@retry(2)
+@debounce(
+    1,
+    unless=lambda i3, event, *args: (
+        isinstance(event, DBusSignal) and event.interface.endswith(".Active")
+    ),
+)
+async def network_manager_status(i3, event, *args):
+	"""Compute network manager status."""
+	
+	# Build status from devices
+	conn = i3.system_bus[DBUS__NM]
+	nm = await conn[DBUS__NM_PATH].get_async_interface(DBUS__NM)
+	devices = await nm.AllDevices
+	for device in devices:
+		nmd = await conn[device].get_async_interface(f"{DBUS__NM}.Device")
+		state = await nmd.State
+		if state == NM_DEVICE_STATE_UNMANAGED:
+			continue
+			
+		await handle_network(conn, nm, device)
+	return
+   
+    
+
+
+### ACPI events with some primitive caching...
+# DBUS doc: https://upower.freedesktop.org/docs/Device.html
+acpi_info = {}
+acpi_cache = ""
+@on(
+    DBusSignal(
+        path=f"{DBUS__UPOWER_PATH}/devices",
+        interface=DBUS__PROPERTIES,
+        member="PropertiesChanged",
+        signature="sa{sv}as",
+        onlyif=lambda args: (
+            args[0] == f"{DBUS__UPOWER}.Device"
+            and (
+				"Online" in args[1] or
+				"TimeToEmpty" in args[1] or
+				"TimeToFull" in args[1] or
+				"Percentage" in args[1]
+			)
+        ),
+    ),
+)
+@retry(2)
+async def power_status(i3, event, p0, p1, data, *args):
+	global acpi_cache
+	
+	logger.debug(f"ACPI-EVT: P0='{p0}'  P1='{p1}'  DATA='{data}'")
+	
+	# Initialize ACPI info
+	if "Online" not in acpi_info: acpi_info["Online"] = None
+	
+	for k in data:
+		v = dbus_unwrap(data[k])
+		#logger.debug("ACPI: %s=%s <%s>" % (k, v, type(v) ))
+		
+		# Some QoL things such as converting seconds to minutes or rounding
+		# floats to 1 decimal place in order to avoid log spamming...
+		if k == "TimeToFull" or k == "TimeToEmpty":
+			acpi_info[k] = str(int(v/60)) + "m"
+		elif k == "UpdateTime":
+			continue
+		elif k in ("EnergyRate", "Energy"):
+			acpi_info[k] = f"{int(v)}W"
+		elif isinstance(v, (float,int)):
+			acpi_info[k] = round(v,1)
+		else:			
+			acpi_info[k] = dbus_unwrap(data[k])
+		
+		# Not really necessary but there are some mutualy exclusive elements
+		# and since we just append to our list, it might be nice to remove
+		# some of the obvious ones...
+		if k == "TimeToFull" or acpi_info["Online"] == True:
+			acpi_info.pop("TimeToEmpty", None)
+		elif k == "TimeToEmpty" or acpi_info["Online"] == False:
+			acpi_info.pop("TimeToFull", None)
+	
+	acpi_text = ", ".join(i + "=" + str(acpi_info[i]) for i in sorted(acpi_info))
+	
+	if acpi_text != acpi_cache:
+		logger.info("ACPI: %s" % acpi_text)
+		acpi_cache = acpi_text
+	
+	return
+
+
+x_event_last_seqnum = -1
+@on(OutputPropertyNotify)
+@debounce(0.5)
+async def x_event_test(i3, disp, event, *args):
+	global x_event_last_seqnum
+	if event._data['atom_x'] == "Backlight":
+		return
+		perc = file_read(backlight_file)
+		
+		
+		if len(perc) == 0:
+			return
+		
+		perc = int(((100 / 255) * float(perc)))
+		
+		h = dict()
+		dbus_dictionary_add(h, "value", int(perc))
+		
+		await notify(
+			i3,
+			app_name= "bri",
+			replaces_id=9020,
+			expire_timeout=1000,
+			app_icon="display-brightness-symbolic.symbolic",
+			summary=f"Brightness {perc}",
+			hints = h,
+			body=f"",
+		)
+	elif event._data['atom_x'] == "EDID":
+		if x_event_last_seqnum == event._data['sequence_number']:
+			return
+		else:
+			x_event_last_seqnum = event._data['sequence_number']
+			logger.info(f"Connected monitors might have been changed for {event._data['output_name']}!")
+			#await i3.command("restart;")
+			
+			cmds = (
+				"/scripts/xrandr.sh autodetect",
+			)
+			for cmd in cmds:
+				proc = subprocess.run(shlex.split(cmd))
+				if proc.returncode != 0:
+					logger.warning(f"{cmd} exited with {proc.returncode}")
+					
+	else:
+		if "atom_x" in event._data and "output_x" in event._data:
+			logger.info(
+				f"RREVENT[{event.__class__.__name__}]:"
+				+ " OUT=" + event._data['output_x']
+				+ " " + event._data['atom_x']
+				+ " (" + event._data['state_x'] + ")"
+			)
+		else:
+			logger.info( f"RREVENT[{event.__class__.__name__}]: {event._data}")
+	
+
+
+@on(
+    FileWatcher(
+        path="/proc/i8k",
+        binary=False,
+        poll=5,
+    ),
+)
+@polybar("i8k")
+async def i8kwatcher(i3, fileinfo):
+	def fan_status( f ):
+		if f == 0: return "x"
+		elif f == 1: return "."
+		elif f == 2: return ":"
+		else: return "?" + str(f) + "?"
+	
+	status = []
+	
+	i8k_data = fileinfo['content'].strip().split(" ")
+	# FORMAT BIOS_VER SERIAL_VER CPUTEMP FANL FANR FANL_SPEED FANR_SPEED AC   FN_KEY
+    # '1.0', '1.6',   '-1',      '63',   '1', '1', '1645',    '1620',   '-1', '-22']
+	
+	if len(i8k_data) < 10:
+		logger.warning(f"Unknown format of i8k data: '{i8k_data}'")
+		return ""
+	
+	i8k = {
+		"format": i8k_data[0],
+		"bios_version": i8k_data[1],
+		"serial_version": i8k_data[2],
+		"cpu_temp": int(i8k_data[3]),
+		"fan_left": {
+				"set": int(i8k_data[4]),
+				"rpm": int(i8k_data[6])
+		},
+		"fan_right": {
+				"set": int(i8k_data[5]),
+				"rpm": int(i8k_data[7])
+		},
+		"ac": i8k_data[8],
+		"fn_key": i8k_data[9]
+	}
+	
+	status.append( fan_status(i8k['fan_left']['set']) )
+	status.append( fan_status(i8k['fan_right']['set']) )
+	status.append( str(i8k['cpu_temp']) )
+
+	color = "#aaa" if i8k['cpu_temp'] < 91 else "#f00"	
+		
+	return "%%{F%s}%s%%{F-}" % (color, " ".join(status))
+
+
+
+# ----------------------------------------------------------------------
+# MAIN
+async def xlib_main(i3, event_filters):
+	logger.debug("XLib worker started")
+	disp = display.Display()
+	
+	if not disp.has_extension('RANDR'):
+		logger.error("X11 does not have the RANDR extension")
+		return
+		
+	randr = disp.xrandr_query_version()
+	logger.debug('X11 has RANDR v%d.%d' % (randr.major_version, randr.minor_version))
+
+	root = disp.screen().root
+	
+	filters_xorg = 0
+	filters_randr = 0
+	
+	for ef_type, ef_value in event_filters:
+		
+		if ef_type == EVENT_MASK_XORG:
+			filters_xorg |= ef_value
+		elif ef_type == EVENT_MASK_RANDR:
+			filters_randr |= ef_value
+		else:
+			logger.warning(f"Xlib filter '{ef}' has unknown type ({ef_type})")
+	
+	if filters_xorg == 0 and filters_randr == 0:
+		logger.warning("No filters for XLib specified, shutting down XLib listener")
+		return
+	
+	root.change_attributes(filters_xorg)
+	root.xrandr_select_input(filters_randr)
+	
+	while True:
+		try:
+			evt_count = root.display.pending_events()
+			if evt_count == 0:
+				await asyncio.sleep(0.2)
+				continue
+		
+			event =  root.display.next_event()
+			
+			# Expand values for all incomming events...
+			
+			# Check for Randr events
+			if event.type == disp.extension_event.CrtcChangeNotify[0]:
+				event._data['type_x'] = "RRNotify"
+				event._data['sub_type_x'] = f"RR{event.__class__.__name__}Event"
+				
+			if "state" in event._data:
+				if event._data['state'] == X.PropertyNewValue:
+					event._data['state_x'] = "PropertyNewValue"
+				elif event._data['state'] == X.PropertyDelete:
+					event._data['state_x'] = "PropertyDelete"
+			
+			if "atom" in event._data:
+				try:
+					event._data['atom_x'] = disp.get_atom_name(event._data['atom'])
+				except:
+					logger.debug(f"Unknown/bad atom {event._data['atom']}")
+					event._data['atom_x'] = None
+					
+			if "output" in event._data:
+				try:
+					oinfo = get_output_info(root, event._data['output'], 0)
+					event._data['output_name'] = oinfo.name
+				except:
+					logger.debug(f"Could not get output info from ID {event._data['output']}")
+					event._data['output_name'] = None
+			
+			
+			for fn, events in on.functions.items():
+				for e in events:
+					if "Xlib" in str(type(event)):
+						if str(type(event)) == str(e):
+							logger.debug("received xlib event %s for %s", event, fn)
+							await fn(i3, disp, event)
+						#else:
+						#	logger.debug("received xlib event %s but noone was interested", event)
+		
+		except asyncio.CancelledError as e:
+			logger.debug("XLib worker interrupted!")
+			return
+
+
+async def filewatcher_main(i3, events):
+	try:
+		logger.debug("FileWatcher worker started")
+		
+		file_blocksize = 1024
+		
+		openfiles = list()
+		
+		ticks = 0
+		
+		for e,func in events:
+			if e.poll == 0:
+				logger.warning(f"Specified non-polling filter for {e.path} - this is not yet supported!")
+				continue
+			
+			# Calculate Greatest Common Denominator (GCD) - we use this to know
+			# what is the longest sleep for our main loop to handle all ticks
+			# For example: if we have 2 pollers (5s and 10s) the GCD=5 meaning
+			# we can sleep for 5s to handle both pollers. If we hage 3 pollers
+			# with times 10, 3 and 5 the GCD will be 1.
+			if ticks == 0: ticks = e.poll
+			ticks = gcd(ticks, e.poll)
+			
+			try:
+				fd = open(e.path, 'rb')
+				logger.debug(f"File '{e.path}' opened for polling every {e.poll}!")
+				openfiles.append({
+									"name": e.path,
+									"poll": e.poll,
+									"content": bytes(),
+									"_t": 0,
+									"_fd": fd,
+									"_f": func,
+									"_bin": e.binary,
+				})
+			except:
+				logger.error(f"Failed to open '{e.path}' for polling!")
+				
+		logger.debug(f"Starting filewatcher loop with tick time of {ticks}s")
+		while True:
+			for of in openfiles:
+				try:
+					of['_t'] += ticks
+					
+					if of['_t'] < (of['poll']-1):
+						continue
+					
+					of['_t'] = 0
+					
+					of['content'] = bytes() if of['_bin'] else ""
+					
+					of['_fd'].seek(0)
+					while True:
+						buf = of['_fd'].read(file_blocksize)
+						if len(buf) <= 0:
+							break;
+						of['content'] += buf if of['_bin'] else buf.decode('utf-8')
+					
+					#logger.debug(f"will run callback for file '{of['name']}'")
+					await of['_f'](i3, of)
+				except Exception as e:
+					logger.error(f"Error during handling of file {of['name']}: {e}")
+				
+			try:
+				await asyncio.sleep(ticks)
+			except asyncio.CancelledError as e:
+				logger.debug("FileWatcher worker interrupted!")
+				
+				for of in openfiles:
+					of['_fd'].close()
+					
+				return
+		
+	except:
+		print("wooooooo")
+
+async def main(options):
+	i3 = await Connection(auto_reconnect=True).connect()
+	i3.session_bus = await ravel.session_bus_async()
+	i3.system_bus = await ravel.system_bus_async()
+	i3.x11 = xcffib.connect()
+
+	# Regular events
+	for fn, events in on.functions.items():
+		for event in events:
+			if isinstance(event, I3Event):
+
+				def wrapping(fn, event):
+					async def wrapped(i3, event):
+						logger.debug("Received i3 event %s for %s", event, fn)
+						return await fn(i3, event)
+
+					return wrapped
+
+				i3.on(event, wrapping(fn, event))
+
+	# React to some bindings
+	async def binding_event(i3, event):
+		"""Process a binding event."""
+		# We only processes it when it is a nop command and we use
+		# this mechanism as an IPC mechanism. The alternative would be
+		# to use ticks but we would need to spawn an i3-msg process
+		# for that.
+		for cmd in event.binding.command.split(";"):
+			cmd = cmd.strip()
+			if not cmd.startswith("nop "):
+				continue
+			cmd = cmd[4:].strip(" \"'")
+			if not cmd:
+				continue
+			kind = cmd.split(":")[0]
+			for fn, events in on.functions.items():
+				for e in events:
+					if isinstance(e, i3CommandEvent) and e.name == kind:
+						logger.debug("Received command event %s for %s", event, fn)
+						await fn(i3, cmd)
+
+	i3.on(I3Event.BINDING, binding_event)
+
+	# React to ticks
+	async def tick_event(i3, event):
+		"""Process tick events."""
+		kind = event.payload.split(":")[0]
+		for fn, events in on.functions.items():
+			for e in events:
+				if isinstance(e, i3CommandEvent) and e.name == kind:
+					logger.debug("Received tick event %s for %s", event, fn)
+					await fn(i3, event.payload)
+
+	i3.on(I3Event.TICK, tick_event)
+
+
+	# Handle FileWatcher events
+	file_filters = list()
+	for fn, events in on.functions.items():
+		for event in events:
+			if isinstance(event, FileWatcher):
+				file_filters.append( (event,fn) )
+
+	if len(file_filters) > 0:
+		logger.debug("We are using some FileWatcher hooks, will start its worker")
+		asyncio.create_task(filewatcher_main(i3, file_filters))
+
+	# Listen to DBus events
+	for fn, events in on.functions.items():
+		for event in events:
+			if isinstance(event, DBusSignal):
+				bus = i3.system_bus if event.system else i3.session_bus
+
+				def wrapping(fn, event):
+					@ravel.signal(
+						name=event.member,
+						in_signature=event.signature,
+						path_keyword="path",
+						args_keyword="args",
+					)
+					async def wrapped(path, args):
+						if event.onlyif is not None and not event.onlyif(args):
+							#logger.debug("Received DBus event for %s, not interested", fn)
+							return
+						logger.debug("Received DBus event %s for %s", event, fn)
+						return await fn(i3, event, path, *args)
+
+					return wrapped
+
+				bus.listen_signal(
+					path=event.path,
+					fallback=True,
+					interface=event.interface,
+					name=event.member,
+					func=wrapping(fn, event),
+				)
+
+
+	
+	# Listen to X.org events
+	active_xevents = list()
+	for fn, events in on.functions.items():
+		for event in events:
+			p = str(event).split("'")
+			
+			if len(p) < 2: continue
+			
+			p = p[1].split(".")
+			
+			if p[0] == "Xlib":
+				if p[-1] in xorg_event_masks:
+					logger.debug(f"X event {p[-1]} added to handled!")
+					active_xevents.append(xorg_event_masks[p[-1]])
+				else:
+					logger.warning(f"Got X event '{event}' but no filters specified!")
+	
+	if len(active_xevents) > 0:
+		logger.debug("We are using some X.org hooks, will start XLib worker")
+		asyncio.create_task(xlib_main(i3, active_xevents))
+	
+		
+	
+		
+	# Run events that should run on start
+	start_tasks = []
+	for fn, events in on.functions.items():
+		for event in events:
+			if event is StartEvent:
+				start_tasks.append(asyncio.create_task(fn(i3, event)))
+
+
+	if USE_SYSTEMD == 1:
+		daemon.notify("READY=1")
+		
+
+	try:
+		await i3.main()
+	except Exception as ex:
+		logger.exception(f"Main loop exception: %s", ex)
+	except:
+		print("")
+		logger.info("Main loop interrupted")
+
+
+
+if __name__ == "__main__":		
+	class FancyFormatter(logging.Formatter):
+		FMT_SEQ="\x1b["
+		ASCII_COLORS = {
+			logging.CRITICAL: 	"1;31", # red + bold
+			logging.ERROR: 		"0;31", # red
+			logging.WARNING: 	"0;33", # yellow
+			logging.INFO: 		"0;37", # white
+			logging.DEBUG: 		"2;37", # gray
+		}
+		
+		def __init__(self, fmt):
+			logging.Formatter.__init__(self, fmt)
+			self._fmt = fmt
+		
+		def format(self, r):
+			return logging.Formatter( self.FMT_SEQ + self.ASCII_COLORS[r.levelno] + "m"
+									+ self._fmt
+									+ self.FMT_SEQ + "0m", "%H:%M:%S"
+				).format(r)
+			
+			
+	# Parse
+	description = sys.modules[__name__].__doc__
+	for fn, events in on.functions.items():
+		description += f" {fn.__doc__}"
+	parser = argparse.ArgumentParser(description=description)
+	parser.add_argument(
+		"--debug",
+		"-d",
+		action="store_true",
+		default=False,
+		help="enable debugging",
+	)
+	parser.add_argument(
+		"--syslog",
+		action="store_true",
+		default=False,
+		help="enable syslog",
+	)
+	
+	options = parser.parse_args()
+
+	# Logging
+	root = logging.getLogger("")
+	root.setLevel(logging.WARNING)
+	logger.setLevel(options.debug and logging.DEBUG or logging.INFO)
+	
+	if sys.stderr.isatty():
+		ch = logging.StreamHandler()
+			
+		logger_fmt = "%(asctime)s.%(msecs)03d [%(levelname).1s]  %(message)s"
+		ch.setFormatter(FancyFormatter(logger_fmt))
+		root.addHandler(ch)
+		logger.info("TTY detected, logging to terminal only...")
+	elif USE_SYSTEMD == True:
+		root.addHandler(journal.JournalHandler(SYSLOG_IDENTIFIER=logger.name))
+		logger.info("SystemD detected!")
+	else:
+		logger.info("No SystemD was detected, using old-school stuff :-)")
+		options.syslog = True
+		
+	if options.syslog:
+		syslog_hndl = logging.handlers.SysLogHandler(address="/dev/log")
+		syslog_hndl.setLevel(logging.INFO)
+		syslog_fmt = "i3master: %(message)s"
+		syslog_hndl.setFormatter(logging.Formatter(syslog_fmt))
+		root.addHandler(syslog_hndl)
+
+
+	try:
+		configfile = os.path.expanduser("~/.config/i3master.conf")
+		config.read(configfile)
+	except Exception as e:
+		logger.error(f"Failed to parse configuration file ({type(e).__name__}), exitting!")
+		logger.error(e)
+		sys.exit(1)
+
+
+	# Load configuration
+	network_helperscript = 	config.get("global", "network_helperscript",
+									  fallback=""
+							)
+
+	backlight_file = config.get("global", "backlight_file",
+								fallback="/sys/class/backlight/*/actual_brightness"
+					)
+
+	xkb_input_monitor = config.get("global", "xkb_input_monitor",
+								fallback="/dev/input/event*"
+						)
+
+	application_icons_ws_ignore = [int(x) if x.isdigit() else x for x in
+										re.split(r'[, \n]+',
+											config.get("workspace-icons",
+													   "ignored-workspaces",
+													   fallback="").strip()
+								  		)
+								  ]
+
+	ap_alias = dict(config.items("ap-aliases")) if "ap-aliases" in config else dict()
+
+
+	try:
+		asyncio.run(main(options))
+	except KeyboardInterrupt:
+		print("Exitting (interrupted)")
+	except Exception as e:
+		logger.exception("__main__ exception: %s", e)
+		sys.exit(1)
+	except:
+		logger.exception("__main__ interrupted!")
+		sys.exit(1)
+	
+	logger.info("Exitting cleanly")
+	sys.exit(0)
